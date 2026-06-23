@@ -69,6 +69,17 @@ elseif(WIN32)
         mfuuid
         wmcodecdspuuid
     )
+elseif(ANDROID)
+    # Android has no RtAudio backend; use Google Oboe (AAudio/OpenSL ES) for
+    # live output. Oboe is supplied as a prefab AAR by the wajuce Android Gradle
+    # module (see android/build.gradle).
+    find_package(oboe REQUIRED CONFIG)
+    target_link_libraries(WAIPlugEngine PRIVATE oboe::oboe log)
+    target_compile_definitions(WAIPlugEngine PRIVATE
+        WAJUCE_USE_OBOE=1
+        WAJUCE_USE_RTAUDIO=0
+        WAJUCE_USE_RTMIDI=0
+    )
 else()
     target_compile_definitions(WAIPlugEngine PRIVATE
         WAJUCE_USE_RTAUDIO=0

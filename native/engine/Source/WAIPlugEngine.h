@@ -28,6 +28,10 @@
 #include <AudioUnit/AudioUnit.h>
 #endif
 
+#if defined(WAJUCE_USE_OBOE) && WAJUCE_USE_OBOE
+#include <oboe/Oboe.h>
+#endif
+
 namespace wajuce {
 
 struct WorkletBridgeState {
@@ -380,6 +384,19 @@ private:
                                          AudioBufferList *ioData);
   AudioComponentInstance appleAudioUnit = nullptr;
   bool appleAudioUnitOpen = false;
+#endif
+
+#if defined(WAJUCE_USE_OBOE) && WAJUCE_USE_OBOE
+  // Android live output. The data callback pulls from render() — the same seam
+  // the RtAudio (desktop) and AudioUnit (iOS) backends use.
+  bool ensureOboeStream();
+  void closeOboeStream();
+  class OboeCallback;  // defined in WAIPlugEngine.cpp
+  std::shared_ptr<oboe::AudioStream> oboeStream;
+  std::shared_ptr<oboe::AudioStreamDataCallback> oboeCallback;
+  bool oboeOpen = false;
+  // Reusable planar scratch so the audio callback never allocates.
+  std::vector<float> oboeScratch;
 #endif
 
   mutable std::recursive_mutex graphMtx;

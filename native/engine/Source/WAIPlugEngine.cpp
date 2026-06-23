@@ -15,6 +15,10 @@
 #include <CoreFoundation/CoreFoundation.h>
 #endif
 
+#if defined(__ANDROID__)
+#include <android/log.h>
+#endif
+
 #if defined(WAJUCE_USE_APPLE_AUDIOUNIT) && WAJUCE_USE_APPLE_AUDIOUNIT &&        \
     defined(__OBJC__)
 #import <AVFoundation/AVFoundation.h>
@@ -42,7 +46,14 @@ constexpr double kPi = 3.14159265358979323846264338327950288;
 constexpr float kSilentFloor = 1.0e-12f;
 constexpr float kNeutralDecaySeconds = 1.0e12f;
 
+#if defined(__ANDROID__)
+// stderr is dropped on Android; route to logcat so backend diagnostics are
+// visible (`adb logcat -s wajuce`).
+#define WA_LOG(fmt, ...) \
+  __android_log_print(ANDROID_LOG_INFO, "wajuce", fmt, ##__VA_ARGS__)
+#else
 #define WA_LOG(fmt, ...) fprintf(stderr, "[wajuce] " fmt "\n", ##__VA_ARGS__)
+#endif
 
 float clampFloat(float v, float lo, float hi) {
   return std::max(lo, std::min(hi, v));
@@ -151,6 +162,9 @@ void Engine::resume() {
 #if defined(WAJUCE_USE_APPLE_AUDIOUNIT) && WAJUCE_USE_APPLE_AUDIOUNIT
   ensureAppleAudioUnit();
 #endif
+#if defined(WAJUCE_USE_OBOE) && WAJUCE_USE_OBOE
+  ensureOboeStream();
+#endif
 }
 
 void Engine::suspend() {
@@ -163,6 +177,9 @@ void Engine::suspend() {
 #if defined(WAJUCE_USE_APPLE_AUDIOUNIT) && WAJUCE_USE_APPLE_AUDIOUNIT
   closeAppleAudioUnit();
 #endif
+#if defined(WAJUCE_USE_OBOE) && WAJUCE_USE_OBOE
+  closeOboeStream();
+#endif
 }
 
 void Engine::close() {
@@ -172,6 +189,9 @@ void Engine::close() {
 #endif
 #if defined(WAJUCE_USE_APPLE_AUDIOUNIT) && WAJUCE_USE_APPLE_AUDIOUNIT
   closeAppleAudioUnit();
+#endif
+#if defined(WAJUCE_USE_OBOE) && WAJUCE_USE_OBOE
+  closeOboeStream();
 #endif
   std::lock_guard<std::recursive_mutex> lock(graphMtx);
   connections.clear();
@@ -2524,6 +2544,116 @@ int Engine::rtAudioCallback(void *outputBuffer, void *inputBuffer, unsigned int 
     }
   }
   return 0;
+}
+#endif
+
+#if defined(WAJUCE_USE_OBOE) && WAJUCE_USE_OBOE
+// Android output backend. Oboe wraps AAudio (API 26+) / OpenSL ES and drives an
+// audio-thread callback; we fill it from the same render() used everywhere else.
+class Engine::OboeCallback : public oboe::AudioStreamDataCallback {
+public:
+  explicit OboeCallback(Engine *engine) : engine_(engine) {}
+
+  oboe::DataCallbackResult onAudioReady(oboe::AudioStream *stream,
+                                        void *audioData,
+                                        int32_t numFrames) override {
+    auto *out = static_cast<float *>(audioData);
+    const int channels = stream ? stream->getChannelCount() : 0;
+    if (!engine_ || !out || numFrames <= 0 || channels <= 0) {
+      return oboe::DataCallbackResult::Continue;
+    }
+    const size_t frameSamples =
+        static_cast<size_t>(numFrames) * static_cast<size_t>(channels);
+    if (engine_->state.load(std::memory_order_relaxed) != 1) {
+      std::fill(out, out + frameSamples, 0.0f);  // not running → silence
+      return oboe::DataCallbackResult::Continue;
+    }
+    // render() writes planar into our preallocated scratch; Oboe wants
+    // interleaved. The resize is a safety net — normally a no-op after open.
+    std::vector<float> &planar = engine_->oboeScratch;
+    if (planar.size() < frameSamples) {
+      planar.resize(frameSamples);
+    }
+    engine_->render(planar.data(), numFrames, channels);
+    for (int i = 0; i < numFrames; ++i) {
+      for (int ch = 0; ch < channels; ++ch) {
+        out[static_cast<size_t>(i) * channels + ch] =
+            planar[static_cast<size_t>(ch) * numFrames + i];
+      }
+    }
+    return oboe::DataCallbackResult::Continue;
+  }
+
+private:
+  Engine *engine_;
+};
+
+bool Engine::ensureOboeStream() {
+  if (oboeOpen && oboeStream) {
+    oboeStream->requestStart();
+    return true;
+  }
+  if (!oboeCallback) {
+    oboeCallback = std::make_shared<OboeCallback>(this);
+  }
+  // Deliberately NOT low latency. The engine renders under a graph mutex that
+  // the UI thread also locks to schedule notes. With a tiny buffer, an underrun
+  // makes the audio thread fire back-to-back and hold that mutex almost
+  // continuously, starving the UI thread into an ANR. A relaxed stream with
+  // large callback chunks leaves wide windows where the lock is free. ~20 ms of
+  // latency is imperceptible for this app.
+  static constexpr int32_t kCallbackFrames = 960;  // ~20 ms @ 48 kHz
+  oboe::AudioStreamBuilder builder;
+  builder.setDirection(oboe::Direction::Output)
+      ->setPerformanceMode(oboe::PerformanceMode::None)
+      ->setSharingMode(oboe::SharingMode::Shared)
+      ->setFormat(oboe::AudioFormat::Float)
+      ->setChannelCount(
+          std::max(1, outputChannels.load(std::memory_order_relaxed)))
+      ->setFramesPerDataCallback(kCallbackFrames)
+      ->setDataCallback(oboeCallback);
+  std::shared_ptr<oboe::AudioStream> stream;
+  const oboe::Result openResult = builder.openStream(stream);
+  if (openResult != oboe::Result::OK || !stream) {
+    WA_LOG("Oboe openStream failed: %s", oboe::convertToText(openResult));
+    return false;
+  }
+  // Adopt the device's actual format, like the Apple path adopts the session.
+  if (stream->getSampleRate() > 0) {
+    sampleRate.store(static_cast<double>(stream->getSampleRate()),
+                     std::memory_order_release);
+  }
+  if (stream->getChannelCount() > 0) {
+    outputChannels.store(stream->getChannelCount(), std::memory_order_release);
+  }
+  bufferSize.store(kCallbackFrames, std::memory_order_release);
+  // Generous buffer so a slow render block doesn't cascade into back-to-back
+  // callbacks (the ANR cause).
+  const int32_t capacity =
+      std::max(stream->getBufferCapacityInFrames(), kCallbackFrames);
+  stream->setBufferSizeInFrames(capacity);
+  // Preallocate the planar scratch so the audio callback never allocates.
+  oboeScratch.assign(static_cast<size_t>(std::max(1, stream->getChannelCount())) *
+                         static_cast<size_t>(capacity),
+                     0.0f);
+  oboeStream = stream;
+  oboeOpen = true;
+  const oboe::Result startResult = oboeStream->requestStart();
+  if (startResult != oboe::Result::OK) {
+    WA_LOG("Oboe requestStart failed: %s", oboe::convertToText(startResult));
+    closeOboeStream();
+    return false;
+  }
+  return true;
+}
+
+void Engine::closeOboeStream() {
+  if (oboeStream) {
+    oboeStream->requestStop();
+    oboeStream->close();
+    oboeStream.reset();
+  }
+  oboeOpen = false;
 }
 #endif
 

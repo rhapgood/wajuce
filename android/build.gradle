@@ -29,6 +29,12 @@ android {
         namespace = "com.acidapps.wajuce"
     }
 
+    // Consume the Oboe prefab AAR (com.google.oboe:oboe) from native CMake via
+    // find_package(oboe). Local fork addition for the Android audio backend.
+    buildFeatures {
+        prefab true
+    }
+
     // Bumping the plugin compileSdk version requires all clients of this plugin
     // to bump the version in their app.
     compileSdk = 34
@@ -61,5 +67,19 @@ android {
 
     defaultConfig {
         minSdk = 21
+
+        externalNativeBuild {
+            cmake {
+                // Oboe's prefab is built against the shared C++ runtime, so the
+                // engine must link the same libc++ for symbols to resolve.
+                arguments "-DANDROID_STL=c++_shared"
+            }
+        }
     }
+}
+
+dependencies {
+    // Local fork addition: Google Oboe is the Android live-audio backend,
+    // consumed via prefab in native/engine/CMakeLists.txt.
+    implementation "com.google.oboe:oboe:1.9.0"
 }
