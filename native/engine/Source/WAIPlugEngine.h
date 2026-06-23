@@ -340,6 +340,17 @@ private:
   bool hasParamInputUnlocked(int32_t nodeId, const char *param) const;
   bool canSkipInactiveMachineNodeUnlocked(Node &node) const;
   bool canSkipSilentGainUnlocked(Node &node);
+  // A scheduled source (oscillator/constant/buffer) whose [start, stop] window
+  // does not overlap the current render block produces only silence, so its
+  // synthesis can be skipped entirely. This is the bulk of the offline-render
+  // speedup: in a song, only a few of many voices sound in any given block.
+  bool canSkipInactiveSourceUnlocked(const Node &node) const;
+  // The [start, end] wall-clock window during which a node can be audible: its
+  // input cone's earliest source start to latest source stop, plus a tail so a
+  // filter's ringdown is never cut. Memoized in renderNodeWindow for one render.
+  // Outside this window the whole subgraph is silent and renderNode skips it —
+  // this is what culls finished/not-yet-started voices (Blink's "tail time").
+  std::pair<double, double> activeWindowUnlocked(int32_t nodeId);
 
   void renderOscillator(Node &node, std::vector<int32_t> &stack);
   void renderConstantSource(Node &node, std::vector<int32_t> &stack);
@@ -415,6 +426,15 @@ private:
   int renderChannels = 2;
   double renderBlockStartTime = 0.0;
   std::vector<float> scratchParam;
+  // Audio input connections grouped by destination node id, rebuilt once at the
+  // top of each render() (connections are stable for the render's duration under
+  // graphMtx). Lets sumInputs() touch only a node's own inputs instead of
+  // scanning the whole `connections` vector per node per block.
+  std::unordered_map<int32_t, std::vector<Connection>> renderConnByDst;
+  // Per-node audible window for the current render (see activeWindowUnlocked).
+  // Only populated when culling is active (acyclic graph, no param connections).
+  std::unordered_map<int32_t, std::pair<double, double>> renderNodeWindow;
+  bool renderCullingActive = false;
   AudioBus realtimeInput;
 
   std::atomic<double> sampleRate{44100.0};

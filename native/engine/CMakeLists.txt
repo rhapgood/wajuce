@@ -109,4 +109,32 @@ if(WAJUCE_BUILD_NATIVE_TESTS)
     )
     add_test(NAME wajuce_webaudio_render_smoke
              COMMAND wajuce_webaudio_render_smoke)
+
+    # Guards against the WAV-export OOM regression: a long offline render over a
+    # dense graph must stay memory-bounded (render() blocks instead of giving
+    # every node a full-length buffer). See NATIVE_BUILDS.md.
+    add_executable(wajuce_offline_render_memory
+        tests/offline_render_memory.cpp
+    )
+    target_link_libraries(wajuce_offline_render_memory PRIVATE WAIPlugEngine)
+    target_include_directories(wajuce_offline_render_memory PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/Source"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../src"
+    )
+    add_test(NAME wajuce_offline_render_memory
+             COMMAND wajuce_offline_render_memory)
+
+    # Guards the chunked-render contract the WAV-export progress UI relies on:
+    # rendering an offline context in slices must be sample-identical to one
+    # full render (slices aligned to bufferSize). See NATIVE_BUILDS.md.
+    add_executable(wajuce_offline_render_chunk_equiv
+        tests/offline_render_chunk_equiv.cpp
+    )
+    target_link_libraries(wajuce_offline_render_chunk_equiv PRIVATE WAIPlugEngine)
+    target_include_directories(wajuce_offline_render_chunk_equiv PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/Source"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../src"
+    )
+    add_test(NAME wajuce_offline_render_chunk_equiv
+             COMMAND wajuce_offline_render_chunk_equiv)
 endif()

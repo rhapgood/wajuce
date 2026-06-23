@@ -1,3 +1,7 @@
+import 'dart:async';
+import 'dart:math' as math;
+import 'dart:typed_data';
+
 import 'audio_buffer.dart';
 import 'backend/backend.dart' as backend;
 import 'context.dart';
@@ -54,6 +58,47 @@ class WAOfflineContext extends WAContext {
       length: _length,
       sampleRate: _offlineSampleRate,
       channels: renderedChannels,
+    );
+  }
+
+  /// Like [startRendering] but renders in [chunkFrames]-sized slices, invoking
+  /// [onProgress] with a 0..1 fraction after each, and `await`-ing the event
+  /// loop between slices so a long render never blocks the caller's thread.
+  ///
+  /// This relies on the **native** engine keeping graph state (oscillator phase,
+  /// filter/delay history, the playback clock) across consecutive `render`
+  /// calls, so N slices produce exactly the same samples as one full render.
+  /// On web `contextRender` is a one-shot stub, so prefer [startRendering]
+  /// there; this is intended for the native offline-export path.
+  Future<WABuffer> startRenderingChunked({
+    int chunkFrames = 0,
+    void Function(double progress)? onProgress,
+  }) async {
+    // Slice on a whole number of render blocks: the engine's output depends on
+    // where block boundaries land, so an unaligned slice would not match a
+    // one-shot render. Round the requested (or default ~0.1 s) chunk up to a
+    // multiple of bufferSize.
+    final block = math.max(1, bufferSize);
+    final wanted = chunkFrames > 0 ? chunkFrames : _offlineSampleRate ~/ 10;
+    final chunk = math.max(1, (wanted / block).ceil()) * block;
+    final channels = List<Float32List>.generate(
+        _numberOfChannels, (_) => Float32List(_length));
+    var done = 0;
+    while (done < _length) {
+      final n = math.min(chunk, _length - done);
+      final slice = backend.contextRender(contextId, n, _numberOfChannels);
+      for (var c = 0; c < _numberOfChannels && c < slice.length; c++) {
+        channels[c].setRange(done, done + n, slice[c]);
+      }
+      done += n;
+      onProgress?.call(done / _length);
+      await Future<void>.delayed(Duration.zero);
+    }
+    return WABuffer(
+      numberOfChannels: _numberOfChannels,
+      length: _length,
+      sampleRate: _offlineSampleRate,
+      channels: channels,
     );
   }
 }

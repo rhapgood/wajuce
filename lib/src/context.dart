@@ -113,6 +113,12 @@ class WAContext {
   /// The context ID (internal).
   int get contextId => _ctxId;
 
+  /// The render block size requested at construction. The engine renders in
+  /// blocks of this size, and some per-block computation makes output depend on
+  /// where block boundaries fall — so a chunked offline render must slice on a
+  /// multiple of this to stay sample-identical to a one-shot render.
+  int get bufferSize => _requestedBufferSize;
+
   /// The output destination node.
   WADestinationNode get destination => _destination;
 

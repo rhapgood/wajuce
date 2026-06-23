@@ -25,6 +25,7 @@
 #endif
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
@@ -1123,10 +1124,11 @@ void Engine::sumInputs(Node &node, std::vector<int32_t> &stack,
   input.resize(renderChannels, renderFrames);
   input.clear();
 
-  for (const auto &connection : connections) {
-    if (connection.dst != node.id) {
-      continue;
-    }
+  const auto inputsIt = renderConnByDst.find(node.id);
+  if (inputsIt == renderConnByDst.end()) {
+    return;
+  }
+  for (const auto &connection : inputsIt->second) {
     const bool cycle = std::find(stack.begin(), stack.end(), connection.src) !=
                        stack.end();
     const AudioBus *srcBus = nullptr;
@@ -1197,6 +1199,105 @@ bool Engine::canSkipSilentGainUnlocked(Node &node) {
                                         getSampleRate(), renderFrames);
 }
 
+bool Engine::canSkipInactiveSourceUnlocked(const Node &node) const {
+  // Only scheduled generators have a [start, stop] window; their per-sample
+  // loops already emit silence outside it. Detect that here so the whole node
+  // (and the recursion into it) is skipped instead of looping over silence.
+  double start = -1.0;
+  double stop = 0.0;
+  switch (node.kind) {
+  case NodeKind::Oscillator:
+  case NodeKind::ConstantSource:
+    start = node.startTime;
+    stop = node.stopTime;
+    break;
+  case NodeKind::BufferSource:
+    start = node.sourceStartTime;
+    stop = node.sourceStopTime;
+    break;
+  default:
+    return false;
+  }
+  // Never started (no start() call) -> always silent.
+  if (start < 0.0) {
+    return true;
+  }
+  const double sr = getSampleRate();
+  const double blockStart = renderBlockStartTime;
+  const double blockEnd =
+      renderBlockStartTime + (sr > 0.0 ? renderFrames / sr : 0.0);
+  // Block is entirely before the note starts, or entirely after it ends.
+  return blockEnd <= start || blockStart >= stop;
+}
+
+std::pair<double, double> Engine::activeWindowUnlocked(int32_t nodeId) {
+  constexpr double kInf = std::numeric_limits<double>::infinity();
+  // Tail headroom past a chain's last source-stop before we treat it as silent,
+  // so a filter's/compressor's ringdown is never cut. Far longer than any
+  // audio-band filter decay; correctness over a few extra silent blocks.
+  constexpr double kTail = 2.0;
+
+  auto memo = renderNodeWindow.find(nodeId);
+  if (memo != renderNodeWindow.end()) {
+    return memo->second;
+  }
+  // Seed with the empty window first; culling only runs on acyclic graphs, but
+  // this also stops any unexpected re-entry from recursing forever.
+  renderNodeWindow[nodeId] = {kInf, -kInf};
+
+  const Node *node = findNodeUnlocked(nodeId);
+  if (!node) {
+    return renderNodeWindow[nodeId];
+  }
+
+  std::pair<double, double> window{kInf, -kInf};
+  switch (node->kind) {
+  case NodeKind::Oscillator:
+  case NodeKind::ConstantSource:
+    window = node->startTime < 0.0 ? std::make_pair(kInf, -kInf)
+                                   : std::make_pair(node->startTime,
+                                                    node->stopTime);
+    break;
+  case NodeKind::BufferSource:
+    window = node->sourceStartTime < 0.0
+                 ? std::make_pair(kInf, -kInf)
+                 : std::make_pair(node->sourceStartTime, node->sourceStopTime);
+    break;
+  // Nodes that can keep producing sound after their inputs go silent (delay
+  // ringout, convolution tail, live/worklet sources) must never be culled —
+  // mark them (and therefore anything downstream) always-active.
+  case NodeKind::Delay:
+  case NodeKind::Convolver:
+  case NodeKind::WorkletBridge:
+  case NodeKind::MediaStreamSource:
+    window = {-kInf, kInf};
+    break;
+  default: {
+    // Derived nodes span their input cone; add a tail for stateful filters.
+    double start = kInf;
+    double end = -kInf;
+    auto it = renderConnByDst.find(nodeId);
+    if (it != renderConnByDst.end()) {
+      for (const auto &c : it->second) {
+        const auto w = activeWindowUnlocked(c.src);
+        start = std::min(start, w.first);
+        end = std::max(end, w.second);
+      }
+    }
+    if (end > -kInf && (node->kind == NodeKind::BiquadFilter ||
+                        node->kind == NodeKind::IIRFilter ||
+                        node->kind == NodeKind::Compressor)) {
+      end += kTail;
+    }
+    window = {start, end};
+    break;
+  }
+  }
+
+  renderNodeWindow[nodeId] = window;
+  return window;
+}
+
 Engine::AudioBus &Engine::renderNode(int32_t nodeId,
                                      std::vector<int32_t> &stack) {
   auto *node = findNodeUnlocked(nodeId);
@@ -1209,8 +1310,25 @@ Engine::AudioBus &Engine::renderNode(int32_t nodeId,
   node->renderSerial = renderSerial;
   node->current.resize(renderChannels, renderFrames);
   node->current.clear();
+  // Subgraph culling: if this node's whole input cone is silent for this block
+  // (every feeding voice has finished or not yet started), skip it and the
+  // recursion into it. Leaves node->current as the silence cleared just above.
+  if (renderCullingActive) {
+    const auto w = renderNodeWindow.find(nodeId);
+    if (w != renderNodeWindow.end()) {
+      const double blockStart = renderBlockStartTime;
+      const double blockEnd =
+          renderBlockStartTime +
+          (getSampleRate() > 0.0 ? renderFrames / getSampleRate() : 0.0);
+      if (w->second.first > w->second.second || blockEnd <= w->second.first ||
+          blockStart >= w->second.second) {
+        return node->current;
+      }
+    }
+  }
   if (canSkipInactiveMachineNodeUnlocked(*node) ||
-      canSkipSilentGainUnlocked(*node)) {
+      canSkipSilentGainUnlocked(*node) ||
+      canSkipInactiveSourceUnlocked(*node)) {
     return node->current;
   }
 
@@ -2130,33 +2248,111 @@ int32_t Engine::render(float *outData, int32_t frames, int32_t channels) {
     return 0;
   }
   std::lock_guard<std::recursive_mutex> lock(graphMtx);
-  renderFrames = frames;
+
+  // Render in fixed-size blocks rather than one giant pass. Every node holds a
+  // `renderFrames`-sized buffer, so a single full-length offline render would
+  // allocate `nodeCount * channels * frames` floats at once — for a multi-loop
+  // song that is gigabytes and the OS reaps the process (iOS high-watermark
+  // OOM, silent kill on Android). Blocking caps live memory to one buffer per
+  // node and matches how the live audio callback already drives render(): node
+  // state (oscillator phase, biquad/delay history, the `previous` bus) carries
+  // continuity across blocks, and notes are scheduled by absolute time, so the
+  // output is identical to a single pass. Live playback passes frames <=
+  // bufferSize, so it stays a single iteration — unchanged.
+  const int block = std::max(1, bufferSize.load());
+  const double sr = getSampleRate();
   renderChannels = channels;
-  renderBlockStartTime = getCurrentTime();
-  ++renderSerial;
 
-  for (auto &[_, node] : nodes) {
-    node.current.resize(renderChannels, renderFrames);
-    node.current.clear();
+  // Group audio connections by destination once for this whole render (they
+  // can't change while we hold graphMtx). sumInputs() then iterates only a
+  // node's own inputs instead of scanning every connection for every node.
+  renderConnByDst.clear();
+  for (const auto &c : connections) {
+    renderConnByDst[c.dst].push_back(c);
   }
+  // The `previous` bus is only read when summing a feedback cycle (audio in
+  // sumInputs, or a param cycle in addParamInputBlock). With no cycles we can
+  // skip both the per-block clear-all and copyCurrentToPrevious — renderNode
+  // clears each node lazily as it is pulled — saving two O(nodes) buffer passes
+  // per block. feedbackCycleCount tracks audio cycles; connectParam doesn't bump
+  // it, so conservatively keep the old behavior whenever any param connections
+  // exist (rare, and never in a WAV-export graph).
+  const bool hasCycles =
+      feedbackCycleCount.load() > 0 || !paramConnections.empty();
 
-  std::vector<int32_t> stack;
-  AudioBus &destination = renderNode(0, stack);
-  for (int ch = 0; ch < channels; ++ch) {
-    const float *src =
-        ch < destination.channels ? destination.channel(ch) : nullptr;
-    float *dst = outData + static_cast<size_t>(ch * frames);
-    if (src) {
-      std::copy(src, src + frames, dst);
-    } else {
-      std::fill(dst, dst + frames, 0.0f);
+  // Precompute each node's audible window so renderNode can cull whole silent
+  // subgraphs (finished / not-yet-started voices). Acyclic graphs only — with a
+  // feedback cycle a node's activity can't be derived from source times, so we
+  // fall back to rendering everything. Built once; reused for every block.
+  renderNodeWindow.clear();
+  renderCullingActive = !hasCycles;
+  if (renderCullingActive) {
+    for (const auto &entry : nodes) {
+      activeWindowUnlocked(entry.first);
     }
   }
-  copyCurrentToPrevious();
-  const double sr = getSampleRate();
-  if (sr > 0.0) {
-    currentTime.store(renderBlockStartTime + frames / sr,
-                      std::memory_order_release);
+
+  // [wav-render] TEMP instrumentation: trace the offline (multi-block) render so
+  // we can see, on device, whether this block-looped engine is the one running,
+  // how far a WAV export gets, and how long it takes. Gated on frames > block so
+  // the live audio callback (single block) is never logged. Remove once the
+  // export crash/ANR is resolved.
+  const bool trace = frames > block;
+  const std::chrono::steady_clock::time_point traceStart =
+      std::chrono::steady_clock::now();
+  int32_t traceBlocks = 0;
+  if (trace) {
+    WA_LOG("[wav-render] begin: %d frames, %d ch, block=%d, %zu nodes", frames,
+           channels, block, nodes.size());
+  }
+
+  for (int32_t done = 0; done < frames;) {
+    const int32_t blk = std::min<int32_t>(block, frames - done);
+    renderFrames = blk;
+    renderBlockStartTime = getCurrentTime();
+    ++renderSerial;
+
+    if (hasCycles) {
+      for (auto &[_, node] : nodes) {
+        node.current.resize(renderChannels, renderFrames);
+        node.current.clear();
+      }
+    }
+
+    std::vector<int32_t> stack;
+    AudioBus &destination = renderNode(0, stack);
+    for (int ch = 0; ch < channels; ++ch) {
+      const float *src =
+          ch < destination.channels ? destination.channel(ch) : nullptr;
+      float *dst = outData + static_cast<size_t>(ch) * frames + done;
+      if (src) {
+        std::copy(src, src + blk, dst);
+      } else {
+        std::fill(dst, dst + blk, 0.0f);
+      }
+    }
+    if (hasCycles) {
+      copyCurrentToPrevious();
+    }
+    if (sr > 0.0) {
+      currentTime.store(renderBlockStartTime + blk / sr,
+                        std::memory_order_release);
+    }
+    done += blk;
+    if (trace && (++traceBlocks % 256) == 0) {
+      const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - traceStart)
+                          .count();
+      WA_LOG("[wav-render] progress: %d/%d frames (%.0f%%), %lldms elapsed", done,
+             frames, 100.0 * done / frames, static_cast<long long>(ms));
+    }
+  }
+  if (trace) {
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - traceStart)
+                        .count();
+    WA_LOG("[wav-render] done: %d frames in %lldms (%d blocks)", frames,
+           static_cast<long long>(ms), traceBlocks);
   }
   return frames;
 }
