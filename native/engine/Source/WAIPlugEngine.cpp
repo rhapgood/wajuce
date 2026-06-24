@@ -25,7 +25,6 @@
 #endif
 
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
@@ -1129,6 +1128,14 @@ void Engine::sumInputs(Node &node, std::vector<int32_t> &stack,
     return;
   }
   for (const auto &connection : inputsIt->second) {
+    // Skip inputs that are silent this block (finished / not-yet-started
+    // voices). This keeps a high-fan-in mixer bus — every voice summed into one
+    // master — proportional to the *active* voices, not the whole song's worth
+    // of nodes. The skipped input contributes only silence, so the sum is
+    // unchanged. (Never culls when there are cycles; that path is disabled.)
+    if (isCulledThisBlockUnlocked(connection.src)) {
+      continue;
+    }
     const bool cycle = std::find(stack.begin(), stack.end(), connection.src) !=
                        stack.end();
     const AudioBus *srcBus = nullptr;
@@ -1233,9 +1240,11 @@ bool Engine::canSkipInactiveSourceUnlocked(const Node &node) const {
 std::pair<double, double> Engine::activeWindowUnlocked(int32_t nodeId) {
   constexpr double kInf = std::numeric_limits<double>::infinity();
   // Tail headroom past a chain's last source-stop before we treat it as silent,
-  // so a filter's/compressor's ringdown is never cut. Far longer than any
-  // audio-band filter decay; correctness over a few extra silent blocks.
-  constexpr double kTail = 2.0;
+  // so a filter's/compressor's ringdown is never cut. An audio-band biquad rings
+  // out in milliseconds and the default compressor release is ~0.25 s, so 0.5 s
+  // is well clear while keeping the active voice count tight (a long tail keeps
+  // finished voices in the render and is the dominant offline-render cost).
+  constexpr double kTail = 0.5;
 
   auto memo = renderNodeWindow.find(nodeId);
   if (memo != renderNodeWindow.end()) {
@@ -1298,6 +1307,23 @@ std::pair<double, double> Engine::activeWindowUnlocked(int32_t nodeId) {
   return window;
 }
 
+bool Engine::isCulledThisBlockUnlocked(int32_t nodeId) const {
+  if (!renderCullingActive) {
+    return false;
+  }
+  const auto w = renderNodeWindow.find(nodeId);
+  if (w == renderNodeWindow.end()) {
+    return false;
+  }
+  const double sr = getSampleRate();
+  const double blockStart = renderBlockStartTime;
+  const double blockEnd =
+      renderBlockStartTime + (sr > 0.0 ? renderFrames / sr : 0.0);
+  // Empty window (no sources feed it) or block entirely before/after it.
+  return w->second.first > w->second.second || blockEnd <= w->second.first ||
+         blockStart >= w->second.second;
+}
+
 Engine::AudioBus &Engine::renderNode(int32_t nodeId,
                                      std::vector<int32_t> &stack) {
   auto *node = findNodeUnlocked(nodeId);
@@ -1313,18 +1339,8 @@ Engine::AudioBus &Engine::renderNode(int32_t nodeId,
   // Subgraph culling: if this node's whole input cone is silent for this block
   // (every feeding voice has finished or not yet started), skip it and the
   // recursion into it. Leaves node->current as the silence cleared just above.
-  if (renderCullingActive) {
-    const auto w = renderNodeWindow.find(nodeId);
-    if (w != renderNodeWindow.end()) {
-      const double blockStart = renderBlockStartTime;
-      const double blockEnd =
-          renderBlockStartTime +
-          (getSampleRate() > 0.0 ? renderFrames / getSampleRate() : 0.0);
-      if (w->second.first > w->second.second || blockEnd <= w->second.first ||
-          blockStart >= w->second.second) {
-        return node->current;
-      }
-    }
+  if (isCulledThisBlockUnlocked(nodeId)) {
+    return node->current;
   }
   if (canSkipInactiveMachineNodeUnlocked(*node) ||
       canSkipSilentGainUnlocked(*node) ||
@@ -2280,30 +2296,16 @@ int32_t Engine::render(float *outData, int32_t frames, int32_t channels) {
   const bool hasCycles =
       feedbackCycleCount.load() > 0 || !paramConnections.empty();
 
-  // Precompute each node's audible window so renderNode can cull whole silent
-  // subgraphs (finished / not-yet-started voices). Acyclic graphs only — with a
-  // feedback cycle a node's activity can't be derived from source times, so we
-  // fall back to rendering everything. Built once; reused for every block.
+  // Precompute each node's audible window so renderNode/sumInputs can cull whole
+  // silent subgraphs (finished / not-yet-started voices). Acyclic graphs only —
+  // with a feedback cycle a node's activity can't be derived from source times,
+  // so we fall back to rendering everything.
   renderNodeWindow.clear();
   renderCullingActive = !hasCycles;
   if (renderCullingActive) {
     for (const auto &entry : nodes) {
       activeWindowUnlocked(entry.first);
     }
-  }
-
-  // [wav-render] TEMP instrumentation: trace the offline (multi-block) render so
-  // we can see, on device, whether this block-looped engine is the one running,
-  // how far a WAV export gets, and how long it takes. Gated on frames > block so
-  // the live audio callback (single block) is never logged. Remove once the
-  // export crash/ANR is resolved.
-  const bool trace = frames > block;
-  const std::chrono::steady_clock::time_point traceStart =
-      std::chrono::steady_clock::now();
-  int32_t traceBlocks = 0;
-  if (trace) {
-    WA_LOG("[wav-render] begin: %d frames, %d ch, block=%d, %zu nodes", frames,
-           channels, block, nodes.size());
   }
 
   for (int32_t done = 0; done < frames;) {
@@ -2339,20 +2341,6 @@ int32_t Engine::render(float *outData, int32_t frames, int32_t channels) {
                         std::memory_order_release);
     }
     done += blk;
-    if (trace && (++traceBlocks % 256) == 0) {
-      const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                          std::chrono::steady_clock::now() - traceStart)
-                          .count();
-      WA_LOG("[wav-render] progress: %d/%d frames (%.0f%%), %lldms elapsed", done,
-             frames, 100.0 * done / frames, static_cast<long long>(ms));
-    }
-  }
-  if (trace) {
-    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now() - traceStart)
-                        .count();
-    WA_LOG("[wav-render] done: %d frames in %lldms (%d blocks)", frames,
-           static_cast<long long>(ms), traceBlocks);
   }
   return frames;
 }

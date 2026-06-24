@@ -351,6 +351,11 @@ private:
   // Outside this window the whole subgraph is silent and renderNode skips it —
   // this is what culls finished/not-yet-started voices (Blink's "tail time").
   std::pair<double, double> activeWindowUnlocked(int32_t nodeId);
+  // Whether a node is silent for the current render block (its audible window
+  // doesn't overlap the block). sumInputs uses this to skip summing silent
+  // inputs entirely — the key to keeping a high-fan-in mixer bus (every voice
+  // into one master) O(active voices) instead of O(all voices) per block.
+  bool isCulledThisBlockUnlocked(int32_t nodeId) const;
 
   void renderOscillator(Node &node, std::vector<int32_t> &stack);
   void renderConstantSource(Node &node, std::vector<int32_t> &stack);
