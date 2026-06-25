@@ -25,6 +25,9 @@ Cross-platform Web Audio API implementation for Flutter.
     'GCC_PREPROCESSOR_DEFINITIONS' => [
       'WAJUCE_USE_RTAUDIO=0',
       'WAJUCE_USE_RTMIDI=0',
+      # Output-only: keep all microphone symbols out of the binary so apps that
+      # never capture audio don't need NSMicrophoneUsageDescription (ITMS-90683).
+      'WAJUCE_ENABLE_AUDIO_INPUT=0',
     ].join(' '),
     'HEADER_SEARCH_PATHS' => [
       '"$(PODS_TARGET_SRCROOT)/../native/engine/Source"',

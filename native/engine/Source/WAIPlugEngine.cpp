@@ -2848,13 +2848,19 @@ bool Engine::ensureAppleAudioUnit() {
     return true;
   }
 
+#if defined(WAJUCE_ENABLE_AUDIO_INPUT) && WAJUCE_ENABLE_AUDIO_INPUT
   bool inputAllowed = mediaInputRequested.load(std::memory_order_acquire) &&
                       inputChannels.load(std::memory_order_relaxed) > 0;
+#else
+  // Output-only build: never enable the microphone input path.
+  const bool inputAllowed = false;
+#endif
 
 #if defined(__OBJC__)
   @autoreleasepool {
     AVAudioSession *session = [AVAudioSession sharedInstance];
     NSError *error = nil;
+#if defined(WAJUCE_ENABLE_AUDIO_INPUT) && WAJUCE_ENABLE_AUDIO_INPUT
     const AVAudioSessionCategoryOptions options =
         AVAudioSessionCategoryOptionDefaultToSpeaker |
         AVAudioSessionCategoryOptionAllowBluetooth |
@@ -2865,6 +2871,16 @@ bool Engine::ensureAppleAudioUnit() {
       WA_LOG("AVAudioSession setCategory failed: %s",
              error.localizedDescription.UTF8String ?: "unknown");
     }
+#else
+    // Playback-only category: no microphone APIs referenced (ITMS-90683).
+    if (![session setCategory:AVAudioSessionCategoryPlayback
+                  withOptions:AVAudioSessionCategoryOptionMixWithOthers
+                        error:&error]) {
+      WA_LOG("AVAudioSession setCategory failed: %s",
+             error.localizedDescription.UTF8String ?: "unknown");
+    }
+#endif
+#if defined(WAJUCE_ENABLE_AUDIO_INPUT) && WAJUCE_ENABLE_AUDIO_INPUT
     if (inputAllowed) {
       if (session.recordPermission ==
           AVAudioSessionRecordPermissionUndetermined) {
@@ -2899,6 +2915,7 @@ bool Engine::ensureAppleAudioUnit() {
         WA_LOG("AVAudioSession record permission denied");
       }
     }
+#endif  // WAJUCE_ENABLE_AUDIO_INPUT
     error = nil;
     const double requestedSampleRate = getSampleRate();
     if (requestedSampleRate > 0.0 &&
@@ -2974,6 +2991,7 @@ bool Engine::ensureAppleAudioUnit() {
     return false;
   }
 
+#if defined(WAJUCE_ENABLE_AUDIO_INPUT) && WAJUCE_ENABLE_AUDIO_INPUT
   const int inputChannelCount =
       inputAllowed ? std::max(1, inputChannels.load(std::memory_order_relaxed))
                    : 0;
@@ -2988,6 +3006,7 @@ bool Engine::ensureAppleAudioUnit() {
       inputChannels.store(0, std::memory_order_release);
     }
   }
+#endif  // WAJUCE_ENABLE_AUDIO_INPUT
 
   const int channels =
       std::max(1, outputChannels.load(std::memory_order_relaxed));

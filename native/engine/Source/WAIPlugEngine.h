@@ -28,6 +28,16 @@
 #include <AudioUnit/AudioUnit.h>
 #endif
 
+// When 0, the Apple AudioUnit backend is built output-only: it never touches
+// any microphone API (no PlayAndRecord category, no recordPermission /
+// requestRecordPermission:, no RemoteIO input bus). This keeps the binary free
+// of microphone symbols so apps that never capture audio don't need an
+// NSMicrophoneUsageDescription purpose string (Apple ITMS-90683). Defaults to 1
+// to preserve input support for consumers that do capture.
+#ifndef WAJUCE_ENABLE_AUDIO_INPUT
+#define WAJUCE_ENABLE_AUDIO_INPUT 1
+#endif
+
 #if defined(WAJUCE_USE_OBOE) && WAJUCE_USE_OBOE
 #include <oboe/Oboe.h>
 #endif
