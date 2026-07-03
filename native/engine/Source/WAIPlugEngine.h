@@ -304,6 +304,30 @@ public:
     std::vector<std::vector<float>> convolverHistory;
     int convolverWrite = 0;
 
+    // Uniformly-partitioned overlap-save FFT convolution state (see
+    // renderConvolver). Rebuilt from convolverBuffer whenever the IR changes:
+    // block size B = convBlock, FFT size N = 2B, and each partition is stored as
+    // a half-spectrum of convBins = N/2+1 bins, split re/im and flattened as
+    // [partition*convBins + bin]. convFilter* is per IR channel; the FDL and
+    // FIFOs in ConvChan are per render channel (sized lazily to renderChannels).
+    struct ConvChan {
+      std::vector<float> fdlRe;   // frequency-domain delay line: convParts*convBins
+      std::vector<float> fdlIm;
+      int fdlPos = 0;             // newest FDL slot
+      std::vector<float> saved;   // previous input block (convBlock samples)
+      std::vector<float> accum;   // input accumulating toward the next block
+      int fill = 0;               // samples in accum
+      std::vector<float> outFifo; // produced output awaiting emission
+      int outHead = 0;            // read cursor into outFifo
+    };
+    int convBlock = 0;            // B (0 until partitions are built)
+    int convFft = 0;             // N = 2B
+    int convBins = 0;            // N/2 + 1
+    int convParts = 0;           // partitions per IR channel
+    std::vector<std::vector<float>> convFilterRe; // [irCh] -> convParts*convBins
+    std::vector<std::vector<float>> convFilterIm;
+    std::vector<ConvChan> convChans;              // per render channel
+
     std::vector<double> iirFeedforward;
     std::vector<double> iirFeedback;
     std::vector<std::vector<float>> iirInputHistory;
@@ -383,6 +407,9 @@ private:
                     std::vector<int32_t> &stack);
   void renderWaveShaper(Node &node, const AudioBus &input);
   void renderConvolver(Node &node, const AudioBus &input);
+  // Precomputes the frequency-domain filter partitions for [node]'s (already
+  // normalized) IR, used by the partitioned FFT convolver in renderConvolver.
+  void buildConvolverPartitions(Node &node);
   void renderAnalyser(Node &node, const AudioBus &input);
   void renderMediaStreamSource(Node &node);
   void renderWorklet(Node &node, const AudioBus &input);

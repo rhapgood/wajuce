@@ -61,6 +61,61 @@ float clampFloat(float v, float lo, float hi) {
 
 float decibelsToGain(float db) { return std::pow(10.0f, db / 20.0f); }
 
+// Partition/block size for the FFT convolver (see renderConvolver). Must be a
+// power of two. Bigger blocks cut the per-second multiply-add work (which scales
+// as irLen*sampleRate/B) at the cost of B samples of latency; 512 (~11.6 ms at
+// 44.1 kHz) keeps a multi-second IR comfortably real-time even on a modest
+// mobile core while staying well under the threshold where the added latency is
+// perceptible. The FFT size is twice this.
+constexpr int kConvBlock = 512;
+
+// In-place iterative radix-2 Cooley–Tukey FFT. [re]/[im] must have a power-of-two
+// length. inverse=false is the forward transform; inverse=true is the inverse
+// WITHOUT the 1/N scaling (callers that need it divide afterwards). Used only by
+// the partitioned convolution engine, whose sizes are always powers of two.
+void fftRadix2(std::vector<float> &re, std::vector<float> &im, bool inverse) {
+  const size_t n = re.size();
+  if (n <= 1) {
+    return;
+  }
+  // Bit-reversal permutation.
+  for (size_t i = 1, j = 0; i < n; ++i) {
+    size_t bit = n >> 1;
+    for (; j & bit; bit >>= 1) {
+      j ^= bit;
+    }
+    j ^= bit;
+    if (i < j) {
+      std::swap(re[i], re[j]);
+      std::swap(im[i], im[j]);
+    }
+  }
+  const double sign = inverse ? 1.0 : -1.0;
+  for (size_t len = 2; len <= n; len <<= 1) {
+    const double ang = sign * 2.0 * kPi / static_cast<double>(len);
+    const float wLenRe = static_cast<float>(std::cos(ang));
+    const float wLenIm = static_cast<float>(std::sin(ang));
+    const size_t half = len >> 1;
+    for (size_t i = 0; i < n; i += len) {
+      float wRe = 1.0f;
+      float wIm = 0.0f;
+      for (size_t k = 0; k < half; ++k) {
+        const size_t a = i + k;
+        const size_t b = a + half;
+        const float vRe = re[b] * wRe - im[b] * wIm;
+        const float vIm = re[b] * wIm + im[b] * wRe;
+        re[b] = re[a] - vRe;
+        im[b] = im[a] - vIm;
+        re[a] += vRe;
+        im[a] += vIm;
+        const float nextWRe = wRe * wLenRe - wIm * wLenIm;
+        wIm = wRe * wLenIm + wIm * wLenRe;
+        wRe = nextWRe;
+      }
+    }
+  }
+}
+
 } // namespace
 
 namespace wajuce {
@@ -1056,6 +1111,12 @@ void Engine::convolverSetBuffer(int32_t nodeId, const float *data,
   node->convolverNormalize = normalize;
   node->convolverHistory.clear();
   node->convolverWrite = 0;
+  // Drop any previously-built FFT partitions; rebuilt below for a valid IR.
+  node->convBlock = 0;
+  node->convParts = 0;
+  node->convFilterRe.clear();
+  node->convFilterIm.clear();
+  node->convChans.clear();
   if (!data || frames <= 0 || channels <= 0) {
     node->convolverBuffer.clear();
     node->convolverFrames = 0;
@@ -1078,6 +1139,7 @@ void Engine::convolverSetBuffer(int32_t nodeId, const float *data,
       }
     }
   }
+  buildConvolverPartitions(*node);
 }
 
 std::shared_ptr<WorkletBridgeState>
@@ -2085,47 +2147,201 @@ void Engine::renderWaveShaper(Node &node, const AudioBus &input) {
   }
 }
 
+void Engine::buildConvolverPartitions(Node &node) {
+  node.convChans.clear();
+  node.convFilterRe.clear();
+  node.convFilterIm.clear();
+  node.convBlock = 0;
+  node.convFft = 0;
+  node.convBins = 0;
+  node.convParts = 0;
+
+  const int frames = node.convolverFrames;
+  const int channels = node.convolverChannels;
+  if (frames <= 0 || channels <= 0 || node.convolverBuffer.empty()) {
+    return;
+  }
+
+  const int B = kConvBlock;
+  const int N = 2 * B;
+  const int bins = N / 2 + 1;
+  const int parts = (frames + B - 1) / B;
+  node.convBlock = B;
+  node.convFft = N;
+  node.convBins = bins;
+  node.convParts = parts;
+  node.convFilterRe.assign(
+      static_cast<size_t>(channels),
+      std::vector<float>(static_cast<size_t>(parts) * bins, 0.0f));
+  node.convFilterIm.assign(
+      static_cast<size_t>(channels),
+      std::vector<float>(static_cast<size_t>(parts) * bins, 0.0f));
+
+  // FFT each B-sample slice of the IR (zero-padded to N) into a half-spectrum.
+  // The IR buffer is planar: channel ch occupies [ch*frames, ch*frames+frames).
+  std::vector<float> re(static_cast<size_t>(N));
+  std::vector<float> im(static_cast<size_t>(N));
+  for (int ch = 0; ch < channels; ++ch) {
+    const size_t base = static_cast<size_t>(ch) * frames;
+    for (int p = 0; p < parts; ++p) {
+      std::fill(re.begin(), re.end(), 0.0f);
+      std::fill(im.begin(), im.end(), 0.0f);
+      const int start = p * B;
+      const int count = std::min(B, frames - start);
+      for (int k = 0; k < count; ++k) {
+        re[static_cast<size_t>(k)] =
+            node.convolverBuffer[base + static_cast<size_t>(start + k)];
+      }
+      fftRadix2(re, im, false);
+      float *fr = node.convFilterRe[static_cast<size_t>(ch)].data() +
+                  static_cast<size_t>(p) * bins;
+      float *fi = node.convFilterIm[static_cast<size_t>(ch)].data() +
+                  static_cast<size_t>(p) * bins;
+      for (int b = 0; b < bins; ++b) {
+        fr[b] = re[static_cast<size_t>(b)];
+        fi[b] = im[static_cast<size_t>(b)];
+      }
+    }
+  }
+}
+
+// Uniformly-partitioned overlap-save FFT convolution. The naive form (summing
+// the whole IR for every output sample) is O(irLen) per sample — fine on the
+// browser's FFT-backed ConvolverNode but hopeless on native for multi-second
+// IRs. Here each render channel runs a fixed B-sample block through one forward
+// FFT, a per-partition frequency-domain multiply-accumulate against a
+// frequency-domain delay line (FDL) of past input blocks, and one inverse FFT;
+// the valid (alias-free) second half of each result is the output. Input is
+// buffered to the block size so the block stays a power of two regardless of the
+// host's render quantum, at the cost of ~B samples (~11.6 ms) of latency. The
+// filter partitions are precomputed in buildConvolverPartitions.
 void Engine::renderConvolver(Node &node, const AudioBus &input) {
   node.current.resize(renderChannels, renderFrames);
   node.current.clear();
-  if (node.convolverBuffer.empty() || node.convolverFrames <= 0 ||
-      node.convolverChannels <= 0) {
-    return;
+  if (node.convParts <= 0 || node.convBlock <= 0 || node.convFilterRe.empty()) {
+    return; // no IR loaded (or partitions not built) -> silence
   }
-  if (node.convolverHistory.size() < static_cast<size_t>(renderChannels)) {
-    node.convolverHistory.resize(static_cast<size_t>(renderChannels));
+
+  const int B = node.convBlock;
+  const int N = node.convFft;
+  const int bins = node.convBins;
+  const int parts = node.convParts;
+  const int irChannels = node.convolverChannels;
+  const size_t fdlSize = static_cast<size_t>(parts) * bins;
+
+  if (static_cast<int>(node.convChans.size()) < renderChannels) {
+    node.convChans.resize(static_cast<size_t>(renderChannels));
   }
-  for (auto &history : node.convolverHistory) {
-    if (static_cast<int>(history.size()) != node.convolverFrames) {
-      history.assign(static_cast<size_t>(node.convolverFrames), 0.0f);
+
+  // Scratch reused across channels for this render call.
+  std::vector<float> re(static_cast<size_t>(N));
+  std::vector<float> im(static_cast<size_t>(N));
+  std::vector<float> yr(static_cast<size_t>(bins));
+  std::vector<float> yi(static_cast<size_t>(bins));
+  const float invN = 1.0f / static_cast<float>(N);
+
+  for (int ch = 0; ch < renderChannels; ++ch) {
+    auto &cc = node.convChans[static_cast<size_t>(ch)];
+    // (Re)initialize the channel's state to the current partition layout — also
+    // catches an IR swap that changed the partition count.
+    if (cc.fdlRe.size() != fdlSize ||
+        static_cast<int>(cc.saved.size()) != B) {
+      cc.fdlRe.assign(fdlSize, 0.0f);
+      cc.fdlIm.assign(fdlSize, 0.0f);
+      cc.fdlPos = 0;
+      cc.saved.assign(static_cast<size_t>(B), 0.0f);
+      cc.accum.assign(static_cast<size_t>(B), 0.0f);
+      cc.fill = 0;
+      cc.outFifo.clear();
+      cc.outHead = 0;
     }
-  }
 
-  for (int i = 0; i < renderFrames; ++i) {
-    for (int ch = 0; ch < renderChannels; ++ch) {
-      auto &history = node.convolverHistory[static_cast<size_t>(ch)];
-      const int inputCh = input.channels == 1 ? 0 : std::min(ch, input.channels - 1);
-      history[static_cast<size_t>(node.convolverWrite)] =
-          input.channels > 0 ? input.channel(inputCh)[i] : 0.0f;
+    const int irCh = irChannels == 1 ? 0 : std::min(ch, irChannels - 1);
+    const float *filterRe = node.convFilterRe[static_cast<size_t>(irCh)].data();
+    const float *filterIm = node.convFilterIm[static_cast<size_t>(irCh)].data();
 
-      const int irCh = node.convolverChannels == 1
-                           ? 0
-                           : std::min(ch, node.convolverChannels - 1);
-      const auto irBase = static_cast<size_t>(irCh * node.convolverFrames);
-      double sum = 0.0;
-      int read = node.convolverWrite;
-      for (int k = 0; k < node.convolverFrames; ++k) {
-        sum += history[static_cast<size_t>(read)] *
-               node.convolverBuffer[irBase + static_cast<size_t>(k)];
-        if (--read < 0) {
-          read = node.convolverFrames - 1;
+    const int inputCh = input.channels <= 0
+                            ? -1
+                            : (input.channels == 1
+                                   ? 0
+                                   : std::min(ch, input.channels - 1));
+    const float *in = inputCh >= 0 ? input.channel(inputCh) : nullptr;
+    float *out = node.current.channel(ch);
+
+    for (int i = 0; i < renderFrames; ++i) {
+      cc.accum[static_cast<size_t>(cc.fill++)] = in ? in[i] : 0.0f;
+      if (cc.fill == B) {
+        cc.fill = 0;
+        // Build the length-N frame [previous block | current block] and FFT it.
+        for (int k = 0; k < B; ++k) {
+          re[static_cast<size_t>(k)] = cc.saved[static_cast<size_t>(k)];
+          re[static_cast<size_t>(B + k)] = cc.accum[static_cast<size_t>(k)];
+          im[static_cast<size_t>(k)] = 0.0f;
+          im[static_cast<size_t>(B + k)] = 0.0f;
         }
+        fftRadix2(re, im, false);
+
+        // Push the input spectrum into the FDL (newest slot = fdlPos).
+        float *xr0 = cc.fdlRe.data() + static_cast<size_t>(cc.fdlPos) * bins;
+        float *xi0 = cc.fdlIm.data() + static_cast<size_t>(cc.fdlPos) * bins;
+        for (int b = 0; b < bins; ++b) {
+          xr0[b] = re[static_cast<size_t>(b)];
+          xi0[b] = im[static_cast<size_t>(b)];
+        }
+
+        // Y = sum_p H_p * X[fdlPos - p]  (complex multiply-accumulate).
+        std::fill(yr.begin(), yr.end(), 0.0f);
+        std::fill(yi.begin(), yi.end(), 0.0f);
+        for (int p = 0; p < parts; ++p) {
+          int idx = cc.fdlPos - p;
+          if (idx < 0) {
+            idx += parts;
+          }
+          const float *xr = cc.fdlRe.data() + static_cast<size_t>(idx) * bins;
+          const float *xi = cc.fdlIm.data() + static_cast<size_t>(idx) * bins;
+          const float *hr = filterRe + static_cast<size_t>(p) * bins;
+          const float *hi = filterIm + static_cast<size_t>(p) * bins;
+          for (int b = 0; b < bins; ++b) {
+            yr[static_cast<size_t>(b)] += hr[b] * xr[b] - hi[b] * xi[b];
+            yi[static_cast<size_t>(b)] += hr[b] * xi[b] + hi[b] * xr[b];
+          }
+        }
+
+        // Rebuild the full spectrum from the half (Hermitian symmetry) and take
+        // the inverse FFT; the valid output is the second half of the result.
+        for (int b = 0; b < bins; ++b) {
+          re[static_cast<size_t>(b)] = yr[static_cast<size_t>(b)];
+          im[static_cast<size_t>(b)] = yi[static_cast<size_t>(b)];
+        }
+        for (int b = 1; b < B; ++b) {
+          re[static_cast<size_t>(N - b)] = yr[static_cast<size_t>(b)];
+          im[static_cast<size_t>(N - b)] = -yi[static_cast<size_t>(b)];
+        }
+        fftRadix2(re, im, true);
+        for (int k = 0; k < B; ++k) {
+          const float s = re[static_cast<size_t>(B + k)] * invN;
+          cc.outFifo.push_back(std::isfinite(s) ? s : 0.0f);
+        }
+
+        cc.saved.swap(cc.accum); // current block becomes the next "previous"
+        cc.fdlPos = (cc.fdlPos + 1) % parts;
       }
-      node.current.channel(ch)[i] =
-          std::isfinite(sum) ? static_cast<float>(sum) : 0.0f;
+
+      // Emit one sample; the FIFO is empty only during the initial ~B-sample
+      // priming, where the output is silence.
+      if (cc.outHead < static_cast<int>(cc.outFifo.size())) {
+        out[i] = cc.outFifo[static_cast<size_t>(cc.outHead++)];
+      } else {
+        out[i] = 0.0f;
+      }
     }
-    node.convolverWrite =
-        (node.convolverWrite + 1) % std::max(1, node.convolverFrames);
+
+    // Drop the consumed FIFO prefix so it stays ~B samples, not unbounded.
+    if (cc.outHead > 0) {
+      cc.outFifo.erase(cc.outFifo.begin(),
+                       cc.outFifo.begin() + cc.outHead);
+      cc.outHead = 0;
+    }
   }
 }
 
