@@ -27,6 +27,10 @@ target_include_directories(WAIPlugEngine
         Source
     PRIVATE
         "${IPLUG2_DIR}/IPlug"
+        # WDL supplies win32_utf8.h, which IPlugPlatform.h pulls in under
+        # `#ifdef _WIN32` (Apple/Android never reach that include, so this dir is
+        # only actually needed on Windows — harmless to expose everywhere).
+        "${IPLUG2_DIR}/WDL"
         "${IPLUG2_RTAUDIO_DIR}"
         "${IPLUG2_RTAUDIO_DIR}/include"
         "${IPLUG2_RTMIDI_DIR}"

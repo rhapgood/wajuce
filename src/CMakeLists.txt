@@ -37,6 +37,10 @@ else()
         target_link_options(wajuce PRIVATE
             "LINKER:-force_load,$<TARGET_FILE:WAIPlugEngine>")
     elseif(MSVC)
+        # link.exe won't emit a DLL for a header-only target; give it one object
+        # to anchor. The engine's dllexport'd wajuce_* symbols are re-exported
+        # via /WHOLEARCHIVE below.
+        target_sources(wajuce PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/wajuce_msvc_anchor.cpp")
         target_link_libraries(wajuce PRIVATE WAIPlugEngine)
         target_link_options(wajuce PRIVATE
             "/WHOLEARCHIVE:$<TARGET_FILE:WAIPlugEngine>")

@@ -217,8 +217,9 @@ private:
       case AutomationEventType::SetTarget:
         if (event.timeConstant > 0.0f) {
           value = event.value + (value - event.value) *
-                                    std::exp(-(time - event.time) /
-                                             event.timeConstant);
+                                    static_cast<float>(
+                                        std::exp(-(time - event.time) /
+                                                 event.timeConstant));
         }
         break;
       case AutomationEventType::LinearRamp:

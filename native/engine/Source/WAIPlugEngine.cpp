@@ -3781,6 +3781,11 @@ FFI_PLUGIN_EXPORT void wajuce_convolver_set_normalize(int32_t nodeId,
   }
 }
 
+// This helper returns a C++ type (shared_ptr), but it sits inside the enclosing
+// `extern "C"` block, which would give it C language linkage (MSVC C4190).
+// `extern "C++"` restores C++ language linkage; `static` still keeps it
+// internal to this TU.
+extern "C++" {
 static std::shared_ptr<WorkletBridgeState>
 getBridgeState(int32_t ctxId, int32_t bridgeId) {
   auto e = wajuce::getEngine(ctxId);
@@ -3793,6 +3798,7 @@ getBridgeState(int32_t ctxId, int32_t bridgeId) {
   }
   return state;
 }
+}  // extern "C++"
 
 FFI_PLUGIN_EXPORT float *wajuce_worklet_get_buffer_ptr(int32_t ctxId,
                                                        int32_t bridgeId,
@@ -4031,7 +4037,9 @@ static int decodeWaveAudioData(const uint8_t *encodedData, int32_t len,
     return -1;
   }
   const int bytesPerSample = bits / 8;
-  if (bytesPerSample <= 0 || pcmBytes < channels * bytesPerSample) {
+  if (bytesPerSample <= 0 ||
+      pcmBytes < static_cast<uint32_t>(channels) *
+                     static_cast<uint32_t>(bytesPerSample)) {
     return -1;
   }
   const int frames = static_cast<int>(pcmBytes / (channels * bytesPerSample));
