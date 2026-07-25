@@ -56,4 +56,13 @@ else()
         LINKER_LANGUAGE CXX
     )
     target_compile_definitions(wajuce PUBLIC DART_SHARED_LIB)
+
+    # Android 15+ / Google Play require 64-bit native libraries to load on
+    # devices with a 16 KB memory page size. Align ELF LOAD segments to 16 KB so
+    # libwajuce.so (and everything statically linked into it) is compatible.
+    # NDK r28+ does this by default; the explicit flag keeps the build correct
+    # under older NDKs too. See https://developer.android.com/guide/practices/page-sizes
+    if(ANDROID)
+        target_link_options(wajuce PRIVATE "-Wl,-z,max-page-size=16384")
+    endif()
 endif()

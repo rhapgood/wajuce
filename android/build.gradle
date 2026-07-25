@@ -81,5 +81,8 @@ android {
 dependencies {
     // Local fork addition: Google Oboe is the Android live-audio backend,
     // consumed via prefab in native/engine/CMakeLists.txt.
-    implementation "com.google.oboe:oboe:1.9.0"
+    // 1.10.0 ships 16 KB-page-aligned prebuilt .so files (1.9.0's liboboe.so was
+    // only 4 KB aligned, which fails Google Play's Android 15+ 16 KB requirement).
+    // See https://developer.android.com/guide/practices/page-sizes
+    implementation "com.google.oboe:oboe:1.10.0"
 }
