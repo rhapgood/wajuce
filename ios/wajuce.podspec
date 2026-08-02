@@ -13,7 +13,8 @@ Cross-platform Web Audio API implementation for Flutter.
   s.author           = { 'AcidApps' => 'dev@acidapps.io' }
 
   s.source           = { :path => '.' }
-  s.source_files     = 'Classes/WajuceIPlug.mm'
+  # Shared with the Swift Package Manager target in ios/wajuce/Package.swift.
+  s.source_files     = 'wajuce/Sources/wajuce/WajuceIPlug.mm'
   s.dependency 'Flutter'
 
   s.platform = :ios, '15.0'
